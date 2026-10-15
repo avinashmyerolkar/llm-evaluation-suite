@@ -1,0 +1,23 @@
+[
+  {
+    "id": "f001",
+    "query": "How long does a password reset link stay valid?",
+    "ideal_context": [
+      "DUMMY CHUNK: To reset your password, open Settings > Account and click 'Reset password'. A reset link is emailed to the registered address.",
+      "DUMMY CHUNK: For security reasons, password reset links expire 30 minutes after they are issued."
+    ],
+    "source_sessions": [
+      "dummy-doc-account"
+    ]
+  },
+  {
+    "id": "f002",
+    "query": "Can I share a notebook with someone who doesn't have an account?",
+    "ideal_context": [
+      "DUMMY CHUNK: Notebooks can be shared via a public read-only link. Recipients do not need an account to view, but must sign in to edit."
+    ],
+    "source_sessions": [
+      "dummy-doc-sharing"
+    ]
+  }
+]

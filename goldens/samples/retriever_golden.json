@@ -1,0 +1,14 @@
+[
+  {
+    "id": "g001",
+    "query": "How do I reset my Acme Notes password?",
+    "ideal_answer": "Open Settings > Account, click 'Reset password', and follow the link sent to your registered email. The link expires after 30 minutes.",
+    "source": "dummy-doc-account"
+  },
+  {
+    "id": "g002",
+    "query": "What is the file size limit for attachments?",
+    "ideal_answer": "Free accounts can attach files up to 25 MB each; Pro accounts up to 250 MB.",
+    "source": "dummy-doc-attachments"
+  }
+]

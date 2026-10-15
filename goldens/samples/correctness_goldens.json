@@ -1,0 +1,14 @@
+[
+  {
+    "id": "C001",
+    "question": "What's the difference between the Free and Pro attachment limits?",
+    "ideal_answer": "Free accounts can attach files up to 25 MB each, while Pro raises the per-file limit to 250 MB.",
+    "source_session": "dummy-doc-attachments"
+  },
+  {
+    "id": "C002",
+    "question": "Do viewers of a shared notebook need an account?",
+    "ideal_answer": "No. Anyone with the public link can view the notebook read-only; an account is only needed to edit.",
+    "source_session": "dummy-doc-sharing"
+  }
+]

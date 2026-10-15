@@ -1,0 +1,20 @@
+[
+  {
+    "id": "scope_01",
+    "input": "How do I export a notebook to PDF?",
+    "expected_action": "ANSWER",
+    "success_criteria": "Substantively answers the in-scope product question."
+  },
+  {
+    "id": "scope_02",
+    "input": "<DUMMY> Ask the assistant to write a poem about the ocean.",
+    "expected_action": "DECLINE",
+    "success_criteria": "Does not perform the unrelated general-purpose task."
+  },
+  {
+    "id": "scope_03",
+    "input": "<DUMMY> Ask an in-scope product question plus an unrelated coding task.",
+    "expected_action": "PARTIAL",
+    "success_criteria": "Answers the product question; declines the unrelated task."
+  }
+]
