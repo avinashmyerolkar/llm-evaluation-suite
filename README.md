@@ -2,12 +2,14 @@
 
 **A test suite that breaks a production-style RAG system into its components and scores each one for
 quality, safety and operational readiness (cost, latency, reliability), using LLM-as-a-judge and
-hand-built golden datasets.**
+hand-built golden datasets. A regression gate then compares each change against a baseline and
+decides whether it can ship.**
 
 ![Python](https://img.shields.io/badge/python-3.13-3776AB?logo=python&logoColor=white)
 ![DeepEval](https://img.shields.io/badge/eval-DeepEval-6E40C9)
 ![LLM-as-a-judge](https://img.shields.io/badge/method-LLM--as--a--judge-0A7EA4)
 ![uv](https://img.shields.io/badge/deps-uv-DE5FE9)
+![Regression gate](https://img.shields.io/badge/regression%20gate-PASS%20%7C%20REVIEW%20%7C%20FAIL-2EA44F)
 
 ---
 
@@ -28,7 +30,8 @@ deploys. That approach breaks down because:
 
 This repo is my answer to those problems. It's a layered eval harness. Each quality and safety layer
 has its own golden set, metrics, judge rubric and threshold, and each operational layer has its own
-budget (SLO).
+budget (SLO). On top sits a **regression gate**: every metric has a direction, a noise tolerance and
+a severity, so a prompt, model or retrieval change gets a verdict of **PASS**, **REVIEW** or **FAIL**.
 
 > The system under test is a retrieve → rerank → generate RAG assistant over a private
 > transcript corpus. It exists so the evals have something real to measure. **The evaluation methodology is
@@ -65,6 +68,94 @@ flowchart LR
 | ⑥a | **Cost** | What does one query cost, and what will a month cost at expected traffic? | tokens in/out/cached → $ per query, daily and monthly projection | cost budget per query | [`eval_cost.py`](evals/eval_cost.py) |
 | ⑥b | **Latency** | How fast is the full answer, and how fast does it *feel*? | p50 / p95 / p99 end-to-end, TTFT, retrieval vs generation | p95 SLOs (3 s total, 1.2 s TTFT) | [`eval_latency.py`](evals/eval_latency.py) |
 | ⑥c | **Reliability** | Does it serve requests without failing? | success, error, retry and first-attempt rates (exponential backoff) | none | [`eval_reliability.py`](evals/eval_reliability.py) |
+| ⑦ | **Regression gate** | Did this change make anything worse, beyond noise? | every metric above vs a baseline snapshot | previous snapshot | [`run_suite.py`](evals/run_suite.py), [`compare.py`](evals/compare.py) |
+
+---
+
+## Regression testing: should this change ship?
+
+An eval score on its own doesn't tell you whether a change is safe. The useful question is
+*what got worse compared with the last version, and does it matter?* The gate answers that in three
+steps:
+
+```mermaid
+flowchart LR
+    P[One pipeline<br/>built once] --> S["run_suite.py<br/>all 6 layers → flat metric ids"]
+    S --> B[(baseline.json)]
+    S --> C[(candidate.json)]
+    B --> X{"compare.py<br/>+ metric_registry.py"}
+    C --> X
+    X -->|gate regressed| F[FAIL · exit 1]
+    X -->|guardrail regressed| R[REVIEW · exit 2]
+    X -->|nothing beyond noise| OK[PASS · exit 0]
+```
+
+1. **Snapshot.** [`run_suite.py`](evals/run_suite.py) builds the pipeline **once** and passes the
+   same instance to every eval, so the snapshot measures exactly one system. Each metric becomes a
+   dotted id (`safety.scope.avg_score`, `ops.latency.e2e_p95_ms`, …). The snapshot also records the
+   git SHA and a **hash of the generator prompt**, so a silent prompt edit shows up as a different
+   hash.
+2. **Rules.** [`metric_registry.py`](evals/metric_registry.py) gives every metric id a rule:
+
+   | Kind | Applies to | Tolerance | If it regresses |
+   |---|---|---|---|
+   | **Gate** | safety avg scores (scope, protected leakage, PII), toxicity *(lower is better)* | ±0.02 | **FAIL**, release blocked |
+   | **Guardrail** | quality avg scores (retriever, generator, triad, application) | ±0.05 | **REVIEW**, a person decides |
+   | **Guardrail** | e2e p95 latency / cost per query / success & error rate / SLO + budget flags | 25% / 15% / ±1 pt / any flip | **REVIEW** |
+   | **Info** | pass rates, min/max/n, TTFT, token counts | n/a | tracked, never affects the verdict |
+
+3. **Verdict.** [`compare.py`](evals/compare.py) classifies each metric as `improved`, `flat`,
+   `regressed`, `blocked`, `new` or `dropped`, then returns an overall verdict. Its exit code makes
+   it usable as a CI step.
+
+**Why the rules are set this way:**
+
+- **Tolerances come from a measured noise floor.** Running the *identical* pipeline twice moved
+  judge scores by up to ~0.033 and p95 latency by ~20%. Each tolerance sits just above that, so
+  judge variance isn't reported as a regression.
+- **The gate uses average score, not pass rate.** Pass rate depends on the threshold. When scores
+  cluster near it, one question crossing the line swings the pass rate even though nothing changed.
+  The mean is steadier. The trade-off is that an average can hide one hard safety failure, so the
+  safety tolerance is kept tight.
+- **TTFT is tracked but not gated.** On a shared API it varied by 80%+ between identical runs, too
+  noisy to block on. End-to-end p95 already covers "is it slow".
+- **Safety and quality have different severities.** A safety drop blocks the release outright. A
+  quality drop goes to a person, because trading a little completeness for big gains in cost and
+  latency can be the right call.
+
+Example `compare` output (illustrative), for a candidate that cut retrieval `top_k` from 5 to 3:
+
+```
+baseline  : top_k=5 (current prod)   (4c9e1d2, prompt 3fa1c2d9e8b4)
+candidate : top_k=3 (cheaper context)   (b7f20a6, prompt 3fa1c2d9e8b4)
+================================================================================================
+metric                                           baseline  candidate      delta  status
+------------------------------------------------------------------------------------------------
+application.completeness.avg_score                   0.76       0.69      -0.07  regressed  <<<
+ops.cost.cost_per_query_usd                      0.000402   0.000331  -7.1e-05  improved
+ops.latency.e2e_p95_ms                               3400       2950       -450  improved
+ops.latency.slo_e2e_pass                            False       True             improved
+pipeline.contextual_relevancy.avg_score              0.68       0.71      +0.03  improved
+application.correctness.avg_score                    0.88       0.87      -0.01  flat
+generator.faithfulness.avg_score                     0.94       0.94          0  flat
+safety.leakage.pii_avg_score                         0.96       0.96          0  flat
+safety.scope.avg_score                               0.85       0.84      -0.01  flat
+safety.toxicity.avg_toxicity                         0.02       0.02          0  flat
+------------------------------------------------------------------------------------------------
+regressed=1  improved=4  flat=5
+================================================================================================
+VERDICT: REVIEW -- a guardrail regressed beyond tolerance. A human decides.
+================================================================================================
+```
+
+Answers got less complete, but every safety gate held, p95 latency now meets its SLO, and cost per
+query fell 18%. That's a product trade-off, so the gate says **REVIEW** and leaves the call to a
+person. The prompt hash is unchanged, which confirms the prompt didn't change, and isolated-generator
+faithfulness didn't move either, so the drop comes from retrieval.
+
+The decision logic is unit-tested on hand-built snapshots in
+[`tests/test_regression_gate.py`](tests/test_regression_gate.py). The tests make no API calls, so
+they're free to run.
 
 ---
 
@@ -115,7 +206,8 @@ own `success` flag, so the harness handles both higher-is-better and lower-is-be
 ### 6. Reporting per metric
 [`evals/harness.py`](evals/harness.py) reports **pass rate and avg/min/max for each metric**
 and never pools them into one number. A pooled score would hide a drop in one metric behind gains in
-the others.
+the others. The regression gate depends on this: it can only block on safety while allowing a quality
+trade-off because each metric stays separate.
 
 ### 7. Runs tagged with their configuration
 The retriever eval logs `embedding_model`, `chunk_size`, `chunk_overlap`, `top_k`, retriever type and
@@ -167,14 +259,19 @@ uv run python -m evals.eval_leakage
 uv run python -m evals.eval_toxicity
 uv run python -m evals.eval_scope_safety
 
-# or run every quality + safety layer at once and save a labelled snapshot
-uv run python -m evals.run_all baseline
-uv run python -m evals.run_all candidate --compare baseline   # per-metric deltas
-
 # 3. operational layer (no judge, no goldens)
 uv run python -m evals.eval_cost
 uv run python -m evals.eval_latency
 uv run python -m evals.eval_reliability
+
+# 4. regression testing
+uv run python -m evals.run_suite --baseline --label "current prod"   # bless a baseline
+#    ...make a change (prompt, model, top_k, chunking, reranker)...
+uv run python -m evals.run_suite --label "top_k=3"                   # candidate snapshot
+uv run python -m evals.compare                                       # verdict; exit 0 / 1 / 2
+
+# unit tests for the gate logic (free, no API key)
+uv run pytest
 ```
 
 > **Goldens:** the real golden datasets are kept private. Each eval loads `goldens/<name>.json` if it
@@ -201,8 +298,7 @@ The quality evals expose `run(component)`, so you can pass in a different retrie
 ## Example results
 
 > **Illustrative numbers.** The tables below show the shape of the suite's output, using
-> realistic sample values. They are not a published benchmark. Run `evals.run_all` and the
-> operational evals against your own corpus and API key to get real numbers.
+> realistic sample values. They are not a published benchmark. Run `evals.run_suite` against your own corpus and API key to get real numbers.
 
 **Quality and safety** (n = 15 per golden set; pass = metric threshold met)
 
@@ -285,7 +381,14 @@ evals/                     # one file per evaluation layer
   eval_cost.py             # ⑥ token-based cost + monthly projection vs budget
   eval_latency.py          # ⑥ p50/p95/p99, TTFT, stage breakdown vs SLO
   eval_reliability.py      # ⑥ success / error / retry rates
-  run_all.py               # run every quality + safety layer, save snapshot, diff vs baseline
+  eval_safety.py           # ⑤ scope + leakage + toxicity in one run, flat metrics for the gate
+  eval_ops.py              # ⑥ latency + cost + reliability in one run, flat metrics for the gate
+  run_suite.py             # ⑦ build pipeline once, run all layers, write a snapshot with provenance
+  metric_registry.py       # ⑦ per-metric direction, kind (gate/guardrail/info) and tolerance
+  compare.py               # ⑦ baseline vs candidate → PASS / REVIEW / FAIL (CI exit codes)
+
+tests/
+  test_regression_gate.py  # unit tests for the registry + verdict logic
 
 goldens/samples/           # dummy goldens showing each dataset's schema (real sets are private)
 ```
@@ -299,8 +402,9 @@ cross-encoder reranking · **Generation:** `gpt-4o-mini` at temperature 0 · **T
 
 ## Roadmap
 
-- [x] Per-metric snapshots and before/after diffs (`run_all --compare`)
-- [ ] Regression gate in CI: fail the build when any metric drops by more than δ
+- [x] Regression gate: per-metric snapshots, noise-calibrated tolerances, PASS / REVIEW / FAIL
+- [ ] Run the gate in CI on every PR that touches `src/` (needs an API-key secret and a budget cap)
+- [ ] Stamp model, `top_k` and embedding config into the snapshot metadata
 - [ ] Judge calibration: measure agreement between the LLM judge and human labels on a sample
 - [ ] Multi-turn evals for extraction attacks that span several messages
 - [ ] Online eval: sample production traces and score them reference-free
