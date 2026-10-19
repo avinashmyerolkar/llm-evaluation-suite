@@ -5,12 +5,15 @@ Reliability measures whether the RAG application can successfully
 serve requests without failing.
 
 We measure:
-    - success rate
-    - error rate
-    - retry rate
+    - success rate        requests that eventually succeeded
+    - error rate          requests that failed even after all retries
+    - retry rate          requests that needed at least one retry
+    - first-attempt rate  requests that succeeded with no retry at all
 
 Retries are important because a system may eventually succeed while
-still being flaky on the first attempt.
+still being flaky on the first attempt. Retry rate is counted per REQUEST
+(at most once each), so it stays a true percentage; the raw number of retry
+attempts is reported separately.
 """
 
 # ============================================================
@@ -49,7 +52,8 @@ class Reliability:
         self.calls = 0
         self.successes = 0
         self.failures = 0
-        self.retries = 0
+        self.retried_requests = 0   # requests that needed >= 1 retry
+        self.retry_attempts = 0     # total extra attempts across all requests
 
 
 # ============================================================
@@ -72,7 +76,9 @@ def call_with_retries(fn, reliability):
 
             if attempt < MAX_RETRIES:
 
-                reliability.retries += 1
+                if attempt == 0:
+                    reliability.retried_requests += 1
+                reliability.retry_attempts += 1
 
                 # exponential backoff
                 time.sleep(
@@ -127,7 +133,12 @@ def report(rel):
     )
 
     retry_rate = (
-        100 * rel.retries / rel.calls
+        100 * rel.retried_requests / rel.calls
+        if rel.calls else 0
+    )
+
+    first_attempt_rate = (
+        100 * (rel.calls - rel.retried_requests) / rel.calls
         if rel.calls else 0
     )
 
@@ -143,7 +154,9 @@ def report(rel):
 
     print(f"success rate   : {success_rate:.2f}%")
     print(f"error rate     : {error_rate:.2f}%")
-    print(f"retry rate     : {retry_rate:.2f}%")
+    print(f"retry rate     : {retry_rate:.2f}%   (requests needing >= 1 retry)")
+    print(f"first-attempt  : {first_attempt_rate:.2f}%")
+    print(f"retry attempts : {rel.retry_attempts}")
 
     print("=" * 60)
 

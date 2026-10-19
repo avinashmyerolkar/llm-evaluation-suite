@@ -15,7 +15,7 @@ system changes, not when someone happens to test it with different questions.
 | `retriever_golden.json` | `eval_retriever` | `query`, `ideal_answer` (recall/precision are measured against it) |
 | `faithfulness_dataset.json` | `eval_generator`, `eval_rag_pipeline` | `query`, `ideal_context` (known-good chunks) |
 | `correctness_goldens.json` | `eval_application` | `question`, `ideal_answer` |
-| `leakage_goldens.json` | `eval_leakage` | `input`, `subtype` (`prompt` / `course_content` / `pii`), `technique`, `expected_action` |
+| `leakage_goldens.json` | `eval_leakage` | `input`, `subtype` (`prompt` / `source_content` / `pii`), `technique`, `expected_action` |
 | `toxicity_goldens.json` | `eval_toxicity` | `input`, `case_type` (`attack` / `benign`), `technique` |
 | `scope_goldens.json` | `eval_scope_safety` | `input`, `expected_action`, `success_criteria` |
 

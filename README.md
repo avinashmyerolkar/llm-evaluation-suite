@@ -64,7 +64,7 @@ flowchart LR
 | ⑤c | **Scope** | Does it refuse off-topic tasks *and* still answer valid ones? | G-Eval Scope Adherence | expected action + criteria | [`eval_scope_safety.py`](evals/eval_scope_safety.py) |
 | ⑥a | **Cost** | What does one query cost, and what will a month cost at expected traffic? | tokens in/out/cached → $ per query, daily and monthly projection | cost budget per query | [`eval_cost.py`](evals/eval_cost.py) |
 | ⑥b | **Latency** | How fast is the full answer, and how fast does it *feel*? | p50 / p95 / p99 end-to-end, TTFT, retrieval vs generation | p95 SLOs (3 s total, 1.2 s TTFT) | [`eval_latency.py`](evals/eval_latency.py) |
-| ⑥c | **Reliability** | Does it serve requests without failing? | success rate, error rate, retry rate (exponential backoff) | none | [`eval_reliability.py`](evals/eval_reliability.py) |
+| ⑥c | **Reliability** | Does it serve requests without failing? | success, error, retry and first-attempt rates (exponential backoff) | none | [`eval_reliability.py`](evals/eval_reliability.py) |
 
 ---
 
@@ -134,7 +134,9 @@ layer uses no judge and no golden set. It measures directly and checks the resul
   reads real `usage_metadata` (including **cached prompt tokens**, billed at a lower rate), keeps
   prices as named constants, and projects daily and monthly spend at a configurable traffic level.
 - **Reliability counts retries separately from failures.** A request that only succeeds on the
-  third attempt still points to a problem, so retries are tracked apart from final failures.
+  third attempt still points to a problem, so retries are tracked apart from final failures. Retry
+  rate counts each request at most once, so it stays a true percentage, and raw retry attempts are
+  reported alongside it.
 
 ### 9. The prompt is written to pass the evals
 The generator prompt ([`src/generator.py`](src/generator.py)) addresses each failure mode the
@@ -165,6 +167,10 @@ uv run python -m evals.eval_leakage
 uv run python -m evals.eval_toxicity
 uv run python -m evals.eval_scope_safety
 
+# or run every quality + safety layer at once and save a labelled snapshot
+uv run python -m evals.run_all baseline
+uv run python -m evals.run_all candidate --compare baseline   # per-metric deltas
+
 # 3. operational layer (no judge, no goldens)
 uv run python -m evals.eval_cost
 uv run python -m evals.eval_latency
@@ -192,6 +198,71 @@ The quality evals expose `run(component)`, so you can pass in a different retrie
 
 ---
 
+## Example results
+
+> **Illustrative numbers.** The tables below show the shape of the suite's output, using
+> realistic sample values. They are not a published benchmark. Run `evals.run_all` and the
+> operational evals against your own corpus and API key to get real numbers.
+
+**Quality and safety** (n = 15 per golden set; pass = metric threshold met)
+
+| Layer | Metric | Pass rate | Avg score | Threshold |
+|---|---|---:|---:|---:|
+| ① Retriever | Contextual Recall | 86.7% | 0.87 | 0.7 |
+| ① Retriever | Contextual Precision | 80.0% | 0.82 | 0.7 |
+| ② Generator *(golden context)* | Faithfulness | 93.3% | 0.94 | 0.7 |
+| ② Generator *(golden context)* | Answer Relevancy | 93.3% | 0.91 | 0.7 |
+| ③ RAG triad *(live retrieval)* | Contextual Relevancy | 60.0% | 0.68 | 0.7 |
+| ③ RAG triad *(live retrieval)* | Faithfulness | 86.7% | 0.90 | 0.7 |
+| ③ RAG triad *(live retrieval)* | Answer Relevancy | 86.7% | 0.89 | 0.7 |
+| ④ Application | Correctness | 86.7% | 0.88 | 0.7 |
+| ④ Application | Completeness | 73.3% | 0.76 | 0.7 |
+| ④ Application | Style | 80.0% | 0.81 | 0.7 |
+| ⑤ Safety | Prompt Leakage | 100% (5/5) | 0.92 | 0.7 |
+| ⑤ Safety | Source Content Leakage | 80% (4/5) | 0.86 | 0.7 |
+| ⑤ Safety | PII Leakage | 100% (5/5) | 0.96 | 0.9 |
+| ⑤ Safety | Toxicity *(lower is better)* | 100% | 0.02 | ≤ 0.3 |
+| ⑤ Safety | Scope Adherence | 86.7% | 0.85 | 0.7 |
+
+**Operational** (gpt-4o-mini, 4 questions × 5 runs, 2 warm-up runs discarded)
+
+| Measure | p50 | p95 | Budget | Verdict |
+|---|---:|---:|---:|:--:|
+| End-to-end latency | 2,150 ms | 3,400 ms | p95 ≤ 3,000 ms | ❌ |
+| Time to first token | 820 ms | 1,050 ms | p95 ≤ 1,200 ms | ✅ |
+| Retrieval + rerank | 380 ms | 520 ms | — | — |
+| Generation | 1,750 ms | 2,900 ms | — | — |
+
+| Cost | Value |
+|---|---|
+| Avg tokens per query | 1,950 in (1,024 cached) / 310 out |
+| Avg cost per query | $0.00040 (budget $0.0015 ✅) |
+| Projected at 2,000 queries/day | $0.80 / day, ≈ $24 / month |
+| Share of cost from output tokens | ~46% (output is priced 4× input) |
+
+| Reliability (20 requests) | Value |
+|---|---|
+| Success rate | 100% |
+| Retry rate | 5% (1 request needed a retry) |
+| First-attempt success | 95% |
+
+### How to read results like these
+
+- **Compare ② with ③ before you touch the prompt.** In this example, faithfulness is high when the
+  generator gets golden context (0.94) but contextual relevancy under live retrieval is low (0.68).
+  The generator is fine; retrieval is the bottleneck, so you'd tune chunking, `fetch_k` or the
+  reranker next, not the prompt.
+- **Correctness passing while completeness lags** means the answers are true but leave things out.
+  That's a prompt or context-budget issue, not hallucination, which is why the two are scored
+  separately.
+- **A latency SLO can fail while the app still feels fast.** Here the full answer misses its p95
+  budget, but time to first token passes, so with streaming the user sees output in about a second.
+  Whether that ships depends on which SLO you made binding.
+- **Look at safety failures one case at a time.** With 5 cases per subtype, a single miss (4/5 on
+  content leakage) is a specific attack to read and fix, not a rate to average away.
+
+---
+
 ## Repository layout
 
 ```
@@ -214,6 +285,7 @@ evals/                     # one file per evaluation layer
   eval_cost.py             # ⑥ token-based cost + monthly projection vs budget
   eval_latency.py          # ⑥ p50/p95/p99, TTFT, stage breakdown vs SLO
   eval_reliability.py      # ⑥ success / error / retry rates
+  run_all.py               # run every quality + safety layer, save snapshot, diff vs baseline
 
 goldens/samples/           # dummy goldens showing each dataset's schema (real sets are private)
 ```
@@ -227,7 +299,8 @@ cross-encoder reranking · **Generation:** `gpt-4o-mini` at temperature 0 · **T
 
 ## Roadmap
 
-- [ ] Regression gate: save a baseline per metric and fail CI when any metric drops by more than δ
+- [x] Per-metric snapshots and before/after diffs (`run_all --compare`)
+- [ ] Regression gate in CI: fail the build when any metric drops by more than δ
 - [ ] Judge calibration: measure agreement between the LLM judge and human labels on a sample
 - [ ] Multi-turn evals for extraction attacks that span several messages
 - [ ] Online eval: sample production traces and score them reference-free
