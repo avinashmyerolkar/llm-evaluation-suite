@@ -3,13 +3,14 @@
 **A test suite that breaks a production-style RAG system into its components and scores each one for
 quality, safety and operational readiness (cost, latency, reliability), using LLM-as-a-judge and
 hand-built golden datasets. A regression gate then compares each change against a baseline and
-decides whether it can ship.**
+decides whether it can ship, and online evals keep scoring real traffic after release.**
 
 ![Python](https://img.shields.io/badge/python-3.13-3776AB?logo=python&logoColor=white)
 ![DeepEval](https://img.shields.io/badge/eval-DeepEval-6E40C9)
 ![LLM-as-a-judge](https://img.shields.io/badge/method-LLM--as--a--judge-0A7EA4)
 ![uv](https://img.shields.io/badge/deps-uv-DE5FE9)
 ![Regression gate](https://img.shields.io/badge/regression%20gate-PASS%20%7C%20REVIEW%20%7C%20FAIL-2EA44F)
+![Online evals](https://img.shields.io/badge/online%20evals-LangSmith-1C3C3C)
 
 ---
 
@@ -27,11 +28,32 @@ deploys. That approach breaks down because:
 - **Regressions go unnoticed.** A prompt tweak that helps one metric can quietly hurt another.
 - **A correct answer can still fail in production.** It may arrive too slowly, cost too much at
   scale, or fail on a transient API error.
+- **Golden sets go stale.** Real users ask things nobody wrote a test for, so passing offline
+  doesn't mean the app is working in production.
 
 This repo is my answer to those problems. It's a layered eval harness. Each quality and safety layer
 has its own golden set, metrics, judge rubric and threshold, and each operational layer has its own
 budget (SLO). On top sits a **regression gate**: every metric has a direction, a noise tolerance and
 a severity, so a prompt, model or retrieval change gets a verdict of **PASS**, **REVIEW** or **FAIL**.
+After release, an **online worker** scores sampled production traces and writes the results back
+onto each trace.
+
+### The evaluation lifecycle
+
+```mermaid
+flowchart LR
+    D[Change<br/>prompt · model · retrieval] --> O["Offline evals<br/>golden sets, ①–⑥"]
+    O --> G{"Regression gate ⑦<br/>vs baseline"}
+    G -->|FAIL| D
+    G -->|PASS / approved REVIEW| P[Release]
+    P --> T["Production traces<br/>LangSmith"]
+    T --> N["Online evals ⑧<br/>sampled, reference-free"]
+    N -->|low-scoring traces become<br/>new golden cases| O
+```
+
+Offline evals answer *"is this version good?"* before release, the gate answers *"is it worse than
+what's live?"*, and online evals answer *"is it still working on real traffic?"* Production failures
+then become new golden cases, so the offline suite keeps up with real usage.
 
 > The system under test is a retrieve → rerank → generate RAG assistant over a private
 > transcript corpus. It exists so the evals have something real to measure. **The evaluation methodology is
@@ -54,6 +76,7 @@ flowchart LR
     A -. "④ Application quality<br/>Correctness · Completeness · Style" .-> A
     A -. "⑤ Safety<br/>Leakage · PII · Toxicity · Scope" .-> A
     A -. "⑥ Operational<br/>Cost · Latency / TTFT · Reliability" .-> A
+    A -. "⑧ Online (production traces)<br/>Faithfulness · Ans Relevancy · Ctx Relevancy" .-> A
 ```
 
 | # | Layer | What it answers | Metrics | Ground truth | File |
@@ -69,6 +92,7 @@ flowchart LR
 | ⑥b | **Latency** | How fast is the full answer, and how fast does it *feel*? | p50 / p95 / p99 end-to-end, TTFT, retrieval vs generation | p95 SLOs (3 s total, 1.2 s TTFT) | [`eval_latency.py`](evals/eval_latency.py) |
 | ⑥c | **Reliability** | Does it serve requests without failing? | success, error, retry and first-attempt rates (exponential backoff) | none | [`eval_reliability.py`](evals/eval_reliability.py) |
 | ⑦ | **Regression gate** | Did this change make anything worse, beyond noise? | every metric above vs a baseline snapshot | previous snapshot | [`run_suite.py`](evals/run_suite.py), [`compare.py`](evals/compare.py) |
+| ⑧ | **Online evals** | Is the live system still grounded and relevant on real traffic? | RAG triad on sampled LangSmith traces → trace feedback | none (reference-free) | [`eval_online.py`](evals/eval_online.py) |
 
 ---
 
@@ -156,6 +180,54 @@ faithfulness didn't move either, so the drop comes from retrieval.
 The decision logic is unit-tested on hand-built snapshots in
 [`tests/test_regression_gate.py`](tests/test_regression_gate.py). The tests make no API calls, so
 they're free to run.
+
+---
+
+## Online evaluation: is it still working in production?
+
+Offline evals can only test the questions someone thought to write down. Once the app is live,
+[`eval_online.py`](evals/eval_online.py) scores **real traffic**:
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant A as RagPipeline (@traceable)
+    participant L as LangSmith
+    participant W as Online worker (cron)
+    participant J as LLM judge
+    U->>A: question
+    A->>L: trace {query, retrieved context, answer}
+    A-->>U: answer (judging happens later, off the request path)
+    W->>L: list recent RagPipeline traces
+    W->>W: deterministic sample + skip already-scored keys
+    W->>J: faithfulness · answer relevancy · contextual relevancy
+    W->>L: create_feedback(run_id, key, score, reason)
+```
+
+- **Scoring happens off the request path.** `RagPipeline.invoke` is decorated with `@traceable`, so
+  each request logs its query, the post-rerank context and the answer. The worker judges them later,
+  so users never wait on a judge.
+- **The metrics are reference-free.** Production has no answer key, so the worker uses the RAG triad.
+  It judges the answer against the query and the context already in the trace. These are the
+  **same three metrics** as the offline triad (③), so online and offline scores are comparable. A
+  faithfulness gap between the two means production queries differ from the golden set.
+- **Sampling controls cost.** Each trace costs three metrics × several judge calls.
+  `SAMPLE_RATE` controls the share of traces judged, and sampling uses the trace's UUID, so a
+  trace is always or never sampled, across processes and cron runs. Using Python's `hash()` would
+  re-roll every run and slowly score everything.
+- **Re-runs are safe.** The worker skips any metric already in a trace's feedback, so running it
+  again never re-judges or re-bills a trace. Each pass reads only a `LOOKBACK_HOURS` window, and a
+  failing metric never blocks the other two.
+- **Scores land on the trace.** LangSmith stores them as feedback, so you can chart faithfulness
+  over time, set alerts, filter to low scores, and **add the worst traces to the golden sets**,
+  which closes the loop back to offline evaluation.
+
+Sample worker output (illustrative):
+
+```
+[online] pass complete: 27 new scores written to 'rag-online-evals'
+[online] pass complete: 0 new scores written to 'rag-online-evals'     <- nothing new: dedup holds
+```
 
 ---
 
@@ -270,6 +342,10 @@ uv run python -m evals.run_suite --baseline --label "current prod"   # bless a b
 uv run python -m evals.run_suite --label "top_k=3"                   # candidate snapshot
 uv run python -m evals.compare                                       # verdict; exit 0 / 1 / 2
 
+# 5. online evals (needs LANGSMITH_* in .env; traces land in LANGSMITH_PROJECT)
+uv run python -m src.rag_pipeline        # each call is now traced to LangSmith
+uv run python -m evals.eval_online       # poll + score; in production, run one pass via cron
+
 # unit tests for the gate logic (free, no API key)
 uv run pytest
 ```
@@ -366,7 +442,7 @@ src/                       # system under test
   retriever.py             # load → chunk (1000/150) → embed (text-embedding-3-large) → Chroma
   reranker.py              # over-fetch k=10 → cross-encoder (ms-marco-MiniLM-L-6-v2) → top 5
   generator.py             # grounded, injection-resistant prompt; sync + streaming (TTFT)
-  rag_pipeline.py          # returns the full triad {query, context, answer} for scoring
+  rag_pipeline.py          # @traceable; returns the full triad {query, context, answer} for scoring
   export_chroma_chunks.py  # dump the index to hand-pick golden contexts
 
 evals/                     # one file per evaluation layer
@@ -386,6 +462,7 @@ evals/                     # one file per evaluation layer
   run_suite.py             # ⑦ build pipeline once, run all layers, write a snapshot with provenance
   metric_registry.py       # ⑦ per-metric direction, kind (gate/guardrail/info) and tolerance
   compare.py               # ⑦ baseline vs candidate → PASS / REVIEW / FAIL (CI exit codes)
+  eval_online.py           # ⑧ sample production traces, judge the triad, write LangSmith feedback
 
 tests/
   test_regression_gate.py  # unit tests for the registry + verdict logic
@@ -397,7 +474,7 @@ goldens/samples/           # dummy goldens showing each dataset's schema (real s
 
 **Evaluation:** DeepEval (G-Eval, RAG metrics, safety metrics), LLM-as-a-judge (`gpt-4o-mini`)
 · **Retrieval:** LangChain, Chroma, OpenAI `text-embedding-3-large`, Sentence-Transformers
-cross-encoder reranking · **Generation:** `gpt-4o-mini` at temperature 0 · **Tracing:** LangSmith
+cross-encoder reranking · **Generation:** `gpt-4o-mini` at temperature 0 · **Tracing & online evals:** LangSmith (traces + feedback)
 · **Tooling:** uv, pytest
 
 ## Roadmap
@@ -407,7 +484,9 @@ cross-encoder reranking · **Generation:** `gpt-4o-mini` at temperature 0 · **T
 - [ ] Stamp model, `top_k` and embedding config into the snapshot metadata
 - [ ] Judge calibration: measure agreement between the LLM judge and human labels on a sample
 - [ ] Multi-turn evals for extraction attacks that span several messages
-- [ ] Online eval: sample production traces and score them reference-free
+- [x] Online evals: sampled, reference-free triad on production traces, written back as feedback
+- [ ] Online safety: run the toxicity and PII judges on sampled traces, with alerts on any failure
+- [ ] Auto-promote low-scoring production traces into a review queue for the golden sets
 - [ ] Load testing: latency and error rate under concurrent traffic
 - [x] Cost, latency and reliability evals
 

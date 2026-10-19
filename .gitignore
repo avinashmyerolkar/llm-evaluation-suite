@@ -17,6 +17,7 @@ wheels/
 # OS / editor
 .DS_Store
 .idea/
+.pytest_cache/
 .vscode/
 
 # Source corpus + derived artifacts (licensed course material — not redistributable)
