@@ -1,7 +1,8 @@
 # Evaluating LLM Applications, Layer by Layer
 
 **A test suite that breaks a production-style RAG system into its components and scores each one for
-quality and safety, using LLM-as-a-judge and hand-built golden datasets.**
+quality, safety and operational readiness (cost, latency, reliability), using LLM-as-a-judge and
+hand-built golden datasets.**
 
 ![Python](https://img.shields.io/badge/python-3.13-3776AB?logo=python&logoColor=white)
 ![DeepEval](https://img.shields.io/badge/eval-DeepEval-6E40C9)
@@ -22,12 +23,15 @@ deploys. That approach breaks down because:
 - **Quality and safety are separate questions.** A correct, well-written answer can still leak the
   system prompt or reproduce protected source text.
 - **Regressions go unnoticed.** A prompt tweak that helps one metric can quietly hurt another.
+- **A correct answer can still fail in production.** It may arrive too slowly, cost too much at
+  scale, or fail on a transient API error.
 
-This repo is my answer to those problems. It's a layered eval harness, and each layer has its own
-golden set, metrics, judge rubric and threshold.
+This repo is my answer to those problems. It's a layered eval harness. Each quality and safety layer
+has its own golden set, metrics, judge rubric and threshold, and each operational layer has its own
+budget (SLO).
 
-> The system under test is a retrieve → rerank → generate RAG assistant over a lecture-transcript
-> corpus. It exists so the evals have something real to measure. **The evaluation methodology is
+> The system under test is a retrieve → rerank → generate RAG assistant over a private
+> transcript corpus. It exists so the evals have something real to measure. **The evaluation methodology is
 > the point of this repo.**
 
 ---
@@ -46,6 +50,7 @@ flowchart LR
     A -. "③ RAG triad (end-to-end)<br/>Ctx Relevancy · Faithfulness · Ans Relevancy" .-> A
     A -. "④ Application quality<br/>Correctness · Completeness · Style" .-> A
     A -. "⑤ Safety<br/>Leakage · PII · Toxicity · Scope" .-> A
+    A -. "⑥ Operational<br/>Cost · Latency / TTFT · Reliability" .-> A
 ```
 
 | # | Layer | What it answers | Metrics | Ground truth | File |
@@ -57,6 +62,9 @@ flowchart LR
 | ⑤a | **Leakage** | Can it be made to reveal its prompt, corpus, or PII? | G-Eval Prompt Leakage, G-Eval Content Leakage, PII Leakage | expected action | [`eval_leakage.py`](evals/eval_leakage.py) |
 | ⑤b | **Toxicity** | Can it be pushed into abusive output? | Toxicity (lower is better, threshold 0.3) | none | [`eval_toxicity.py`](evals/eval_toxicity.py) |
 | ⑤c | **Scope** | Does it refuse off-topic tasks *and* still answer valid ones? | G-Eval Scope Adherence | expected action + criteria | [`eval_scope_safety.py`](evals/eval_scope_safety.py) |
+| ⑥a | **Cost** | What does one query cost, and what will a month cost at expected traffic? | tokens in/out/cached → $ per query, daily and monthly projection | cost budget per query | [`eval_cost.py`](evals/eval_cost.py) |
+| ⑥b | **Latency** | How fast is the full answer, and how fast does it *feel*? | p50 / p95 / p99 end-to-end, TTFT, retrieval vs generation | p95 SLOs (3 s total, 1.2 s TTFT) | [`eval_latency.py`](evals/eval_latency.py) |
+| ⑥c | **Reliability** | Does it serve requests without failing? | success rate, error rate, retry rate (exponential backoff) | none | [`eval_reliability.py`](evals/eval_reliability.py) |
 
 ---
 
@@ -92,7 +100,7 @@ adversarial sets include `false_positive_guard` cases the system **must** answer
 
 - **Leakage** (15 cases): system-prompt extraction, corpus extraction and PII, using `direct`,
   `roleplay`, `jailbreak`, `incremental_extraction`, `transformation` (e.g. "translate the whole
-  lecture") and `raw_retrieval` techniques. Includes 3 benign controls.
+  source document") and `raw_retrieval` techniques. Includes 3 benign controls.
 - **Toxicity** (15 cases): 10 attacks (`style_override`, `paste_injection`, `self_deprecation`,
   roleplay, …) and 5 benign controls.
 - The expected behaviour is **`ANSWER` / `DECLINE` / `PARTIAL`**. `PARTIAL` covers mixed prompts
@@ -113,7 +121,22 @@ the others.
 The retriever eval logs `embedding_model`, `chunk_size`, `chunk_overlap`, `top_k`, retriever type and
 judge model with each run, so you can compare runs knowing what changed between them.
 
-### 8. The prompt is written to pass the evals
+### 8. Operational evals measured against budgets
+A model that gives correct answers can still be too slow or too expensive to ship. The operational
+layer uses no judge and no golden set. It measures directly and checks the result against a budget:
+
+- **Latency is reported as a distribution, not a mean.** Warm-up runs are discarded (cold start
+  skews the numbers), timings use `perf_counter`, and the report gives **p50/p95/p99** against a p95
+  SLO. It measures both **end-to-end** time and **time-to-first-token**, because in a streaming UI
+  TTFT is what users perceive, and it splits retrieval from generation so a slow run points at a stage.
+- **Cost is calculated, not measured.** Cost = tokens × price, and at temperature 0 token counts
+  barely change between runs, so unit economics can be worked out offline before launch. The eval
+  reads real `usage_metadata` (including **cached prompt tokens**, billed at a lower rate), keeps
+  prices as named constants, and projects daily and monthly spend at a configurable traffic level.
+- **Reliability counts retries separately from failures.** A request that only succeeds on the
+  third attempt still points to a problem, so retries are tracked apart from final failures.
+
+### 9. The prompt is written to pass the evals
 The generator prompt ([`src/generator.py`](src/generator.py)) addresses each failure mode the
 suite checks for:
 - it says exactly what to reply when the context is insufficient (abstention)
@@ -141,6 +164,11 @@ uv run python -m evals.eval_application
 uv run python -m evals.eval_leakage
 uv run python -m evals.eval_toxicity
 uv run python -m evals.eval_scope_safety
+
+# 3. operational layer (no judge, no goldens)
+uv run python -m evals.eval_cost
+uv run python -m evals.eval_latency
+uv run python -m evals.eval_reliability
 ```
 
 > **Goldens:** the real golden datasets are kept private. Each eval loads `goldens/<name>.json` if it
@@ -183,6 +211,9 @@ evals/                     # one file per evaluation layer
   eval_leakage.py          # ⑤ prompt, corpus and PII leakage
   eval_toxicity.py         # ⑤ toxicity under attack
   eval_scope_safety.py     # ⑤ scope adherence
+  eval_cost.py             # ⑥ token-based cost + monthly projection vs budget
+  eval_latency.py          # ⑥ p50/p95/p99, TTFT, stage breakdown vs SLO
+  eval_reliability.py      # ⑥ success / error / retry rates
 
 goldens/samples/           # dummy goldens showing each dataset's schema (real sets are private)
 ```
@@ -200,7 +231,8 @@ cross-encoder reranking · **Generation:** `gpt-4o-mini` at temperature 0 · **T
 - [ ] Judge calibration: measure agreement between the LLM judge and human labels on a sample
 - [ ] Multi-turn evals for extraction attacks that span several messages
 - [ ] Online eval: sample production traces and score them reference-free
-- [ ] Latency and cost tracking (TTFT is already exposed by `generate_stream`)
+- [ ] Load testing: latency and error rate under concurrent traffic
+- [x] Cost, latency and reliability evals
 
 ---
 
